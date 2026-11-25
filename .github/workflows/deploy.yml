@@ -1,0 +1,127 @@
+name: Sync upstream release & deploy
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"   # every 15 minutes
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Redeploy even if tag unchanged"
+        type: boolean
+        default: false
+      tag:
+        description: "Deploy a specific upstream tag (rollback); empty = latest release"
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: mango0114/rose-panel-bot
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve target tag
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG=$(gh api "repos/$UPSTREAM/releases/latest" --jq .tag_name)
+          fi
+          [ -n "$TAG" ] || { echo "no tag"; exit 1; }
+          CUR=$(cat DEPLOYED_TAG 2>/dev/null || true)
+          echo "target=$TAG current=$CUR"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          if [ "$TAG" = "$CUR" ] && [ "${{ inputs.force }}" != "true" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout upstream
+        if: steps.tag.outputs.skip == 'false'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: ${{ steps.tag.outputs.tag }}
+          path: upstream
+
+      - uses: actions/setup-node@v4
+        if: steps.tag.outputs.skip == 'false'
+        with:
+          node-version: 22
+
+      - name: Install, test, build
+        if: steps.tag.outputs.skip == 'false'
+        working-directory: upstream
+        run: |
+          npm ci --no-audit --no-fund
+          npm test
+          npm run build
+
+      - name: Add custom static assets (avatar etc.)
+        if: steps.tag.outputs.skip == 'false'
+        run: cp -r static/. upstream/dist/
+
+      - name: Generate deploy config
+        if: steps.tag.outputs.skip == 'false'
+        env:
+          KV_ID: ${{ secrets.KV_ID }}
+          ADMIN_IDS: ${{ secrets.ADMIN_IDS }}
+        run: python3 patch_wrangler.py upstream/wrangler.toml upstream/wrangler.deploy.toml
+
+      - name: Deploy to Cloudflare
+        if: steps.tag.outputs.skip == 'false'
+        working-directory: upstream
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          WRANGLER_SEND_METRICS: "false"
+        run: npx wrangler deploy -c wrangler.deploy.toml
+
+      - name: Health check & re-run /setup
+        if: steps.tag.outputs.skip == 'false'
+        env:
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+        run: |
+          for i in 1 2 3 4 5 6; do
+            if curl -fsS https://bot.akina.live/health | tee /tmp/h.json | grep -q '"ok": *true'; then break; fi
+            sleep 10
+          done
+          grep -q '"ok": *true' /tmp/h.json
+          curl -fsS "https://bot.akina.live/setup?secret=${WEBHOOK_SECRET}" -o /tmp/setup.json
+          python3 -c 'import json;d=json.load(open("/tmp/setup.json"));r=d["results"];print("setWebhook",r["setWebhook"]["ok"]);assert d["ok"] and r["setWebhook"]["ok"]'
+
+      - name: Record deployed tag
+        if: steps.tag.outputs.skip == 'false'
+        run: |
+          echo "${{ steps.tag.outputs.tag }}" > DEPLOYED_TAG
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          git add DEPLOYED_TAG
+          git commit -m "deploy ${{ steps.tag.outputs.tag }}" || echo "nothing to commit"
+          git push
+
+      # GitHub disables cron workflows in public repos after 60 days without commits.
+      - name: Keepalive
+        if: steps.tag.outputs.skip == 'true'
+        run: |
+          LAST=$(git log -1 --format=%ct)
+          if [ $(( $(date +%s) - LAST )) -gt $(( 45*86400 )) ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+            git commit --allow-empty -m "keepalive"
+            git push
+          fi
