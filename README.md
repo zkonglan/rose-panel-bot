@@ -8,3 +8,5 @@
 
 Secrets（全部在 Actions Secrets，不入库）：`CLOUDFLARE_API_TOKEN`、`CLOUDFLARE_ACCOUNT_ID`、`WEBHOOK_SECRET`、`KV_ID`、`ADMIN_IDS`。
 `BOT_TOKEN` 只存在 Cloudflare Worker secret 里，不经过 GitHub。
+
+<!-- schedule registered on default branch deploy -->
